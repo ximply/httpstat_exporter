@@ -22,6 +22,7 @@ var (
 	listenAddress  = flag.String("unix-sock", "/dev/shm/httpstat_exporter.sock", "Address to listen on for unix sock access and telemetry.")
 	metricsPath    = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 	dest           = flag.String("dest", "", "Destination list to get, multi split with ,.")
+	curl           = flag.Bool("curl", true, "Use curl cmd or not.")
 )
 
 var destList []string
@@ -63,7 +64,7 @@ func doWork() {
 	var wg sync.WaitGroup
 	for _, target := range destList {
 		wg.Add(1)
-		go httpstat.Worker(target, &wg)
+		go httpstat.Worker(target, &wg, *curl)
 	}
 	wg.Wait()
 
