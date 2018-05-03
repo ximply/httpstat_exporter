@@ -15,6 +15,7 @@ import (
 	"sync"
 	"github.com/ximply/httpstat_exporter/httpstat"
 	hs "github.com/tcnksm/go-httpstat"
+	"runtime"
 )
 
 var (
@@ -85,8 +86,13 @@ func metrics(w http.ResponseWriter, r *http.Request) {
 				namespace, k, float64(r.(hs.Result).DNSLookup))
 			ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"tcp_conn\"} %g\n",
 				namespace, k, float64(r.(hs.Result).TCPConnection))
-			ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"tls_handshake\"} %g\n",
-				namespace, k, float64(r.(hs.Result).TLSHandshake))
+			if strings.HasPrefix(k, "https") {
+				ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"tls_handshake\"} %g\n",
+					namespace, k, float64(r.(hs.Result).TLSHandshake))
+			} else {
+				ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"tls_handshake\"} %g\n",
+					namespace, k, float64(0))
+			}
 		}
 	}
 
@@ -115,6 +121,8 @@ func main() {
 	if len(destList) == 0 {
 		panic("no one to ping")
 	}
+
+	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	doing = false
 	doWork()
