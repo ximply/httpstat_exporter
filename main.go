@@ -7,15 +7,16 @@ import (
 	"net/http"
 	"strings"
 	"regexp"
-	"github.com/ximply/ping_exporter/cache"
 	"fmt"
 	"github.com/robfig/cron"
 	"io"
 	"strconv"
 	"sync"
-	"github.com/ximply/httpstat_exporter/httpstat"
 	hs "github.com/tcnksm/go-httpstat"
 	"runtime"
+	"time"
+	"io/ioutil"
+	"os/exec"
 )
 
 var (
@@ -28,7 +29,8 @@ var (
 
 var destList []string
 var doing bool
-
+var g_lock sync.RWMutex
+var g_statMap map[string]hs.Result
 
 func isURI(uri string) (schema, host string, port int, matched bool) {
 	const reExp = `^((?P<schema>((ht|f)tp(s?))|tcp)\://)?((([a-zA-Z0-9_\-]+\.)+[a-zA-Z]{2,})|((?:(?:25[0-5]|2[0-4]\d|[01]\d\d|\d?\d)((\.?\d)\.)){4})|(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9])\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9]|0)\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9]|0)\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[0-9]))(:([0-9]+))?(/[a-zA-Z0-9\-\._\?\,\'/\\\+&amp;%\$#\=~]*)?$`
@@ -56,6 +58,91 @@ func isURI(uri string) (schema, host string, port int, matched bool) {
 	return
 }
 
+func fileExists(file string) (bool, error) {
+	_, err := os.Stat(file)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func worker(uri string, wg *sync.WaitGroup, useCurl bool) {
+	req, err := http.NewRequest("GET", uri, nil)
+	if err != nil {
+		wg.Done()
+		return
+	}
+
+	var result hs.Result
+
+
+	if useCurl {
+		// curl -o /dev/null -s -w %{time_namelookup}:%{time_connect}:%{time_appconnect}
+		// /usr/bin/curl
+		path := "/usr/bin/curl"
+		exist, _ := fileExists(path)
+		if !exist {
+			path, err = exec.LookPath("curl")
+			if err != nil {
+				wg.Done()
+				return
+			}
+		}
+
+		cmdStr := fmt.Sprintf("%s -o /dev/null -s -w %%{time_namelookup}:%%{time_connect}:%%{time_appconnect} %s",
+			path, uri)
+		cmd := exec.Command("/bin/sh", "-c", cmdStr)
+		out, err := cmd.Output()
+		cmd.Wait()
+		if err != nil {
+			wg.Done()
+			return
+		}
+		s := strings.TrimRight(string(out), "\n")
+		l := strings.Split(s, ":")
+		if len(l) == 3 {
+			time_namelookup_tl, _ := strconv.ParseFloat(l[0], 64)
+			time_connect_tl, _ := strconv.ParseFloat(l[1], 64)
+			time_appconnect_tl, _ := strconv.ParseFloat(l[2], 64)
+
+			time_namelookup := time_namelookup_tl * 1000000000
+			time_connect := time_connect_tl * 1000000000 - time_namelookup
+			time_appconnect := time_appconnect_tl * 1000000000 - time_connect - time_namelookup
+
+			result.DNSLookup = time.Duration(time_namelookup) / time.Nanosecond
+			result.TCPConnection = time.Duration(time_connect) / time.Nanosecond
+			result.TLSHandshake = time.Duration(time_appconnect) / time.Nanosecond
+		}
+	} else {
+		ctx := hs.WithHTTPStat(req.Context(), &result)
+		req = req.WithContext(ctx)
+
+		client := http.DefaultClient
+		client.Timeout = 5 * time.Second
+		res, err := client.Do(req)
+		if err != nil {
+			wg.Done()
+			return
+		}
+
+		if _, err := io.Copy(ioutil.Discard, res.Body); err != nil {
+			wg.Done()
+			return
+		}
+		res.Body.Close()
+		result.End(time.Now())
+	}
+
+	g_lock.Lock()
+	g_statMap[uri] = result
+	g_lock.Unlock()
+
+	wg.Done()
+}
+
 func doWork() {
 	if doing {
 		return
@@ -65,7 +152,7 @@ func doWork() {
 	var wg sync.WaitGroup
 	for _, target := range destList {
 		wg.Add(1)
-		go httpstat.Worker(target, &wg, *curl)
+		go worker(target, &wg, *curl)
 	}
 	wg.Wait()
 
@@ -79,16 +166,20 @@ func metrics(w http.ResponseWriter, r *http.Request) {
 
 	ret := ""
 	namespace := "httpstat"
+
+	g_lock.RLock()
+	m := g_statMap
+	g_lock.RUnlock()
+
 	for _, k := range destList {
-		b, r := cache.GetInstance().Value(k)
-		if b && r != nil {
+		if v, ok := m[k]; ok {
 			ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"dns_lookup\"} %g\n",
-				namespace, k, float64(r.(hs.Result).DNSLookup))
+				namespace, k, float64(v.DNSLookup))
 			ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"tcp_conn\"} %g\n",
-				namespace, k, float64(r.(hs.Result).TCPConnection))
+				namespace, k, float64(v.TCPConnection))
 			if strings.HasPrefix(k, "https") {
 				ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"tls_handshake\"} %g\n",
-					namespace, k, float64(r.(hs.Result).TLSHandshake))
+					namespace, k, float64(v.TLSHandshake))
 			} else {
 				ret += fmt.Sprintf("%s{uri=\"%s\",time_line=\"tls_handshake\"} %g\n",
 					namespace, k, float64(0))
@@ -125,7 +216,8 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	doing = false
-	doWork()
+	g_statMap = make(map[string]hs.Result)
+	//doWork()
 	c := cron.New()
 	c.AddFunc("0 */1 * * * ?", doWork)
 	c.Start()
