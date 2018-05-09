@@ -31,6 +31,7 @@ var destList []string
 var doing bool
 var g_lock sync.RWMutex
 var g_statMap map[string]hs.Result
+var g_httpClientMap map[string]*http.Client
 
 func isURI(uri string) (schema, host string, port int, matched bool) {
 	const reExp = `^((?P<schema>((ht|f)tp(s?))|tcp)\://)?((([a-zA-Z0-9_\-]+\.)+[a-zA-Z]{2,})|((?:(?:25[0-5]|2[0-4]\d|[01]\d\d|\d?\d)((\.?\d)\.)){4})|(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9])\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9]|0)\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[1-9]|0)\.(25[0-5]|2[0-4][0-9]|[0-1]{1}[0-9]{2}|[1-9]{1}[0-9]{1}|[0-9]))(:([0-9]+))?(/[a-zA-Z0-9\-\._\?\,\'/\\\+&amp;%\$#\=~]*)?$`
@@ -70,14 +71,7 @@ func fileExists(file string) (bool, error) {
 }
 
 func worker(uri string, wg *sync.WaitGroup, useCurl bool) {
-	req, err := http.NewRequest("GET", uri, nil)
-	if err != nil {
-		wg.Done()
-		return
-	}
-
 	var result hs.Result
-
 
 	if useCurl {
 		// curl -o /dev/null -s -w %{time_namelookup}:%{time_connect}:%{time_appconnect}
@@ -85,11 +79,12 @@ func worker(uri string, wg *sync.WaitGroup, useCurl bool) {
 		path := "/usr/bin/curl"
 		exist, _ := fileExists(path)
 		if !exist {
-			path, err = exec.LookPath("curl")
+			path2, err := exec.LookPath("curl")
 			if err != nil {
 				wg.Done()
 				return
 			}
+			path = path2
 		}
 
 		cmdStr := fmt.Sprintf("%s -o /dev/null -s -w %%{time_namelookup}:%%{time_connect}:%%{time_appconnect} %s",
@@ -117,22 +112,31 @@ func worker(uri string, wg *sync.WaitGroup, useCurl bool) {
 			result.TLSHandshake = time.Duration(time_appconnect) / time.Nanosecond
 		}
 	} else {
-		ctx := hs.WithHTTPStat(req.Context(), &result)
-		req = req.WithContext(ctx)
-
-		client := http.DefaultClient
-		client.Timeout = 5 * time.Second
-		res, err := client.Do(req)
+		req, err := http.NewRequest("GET", uri, nil)
 		if err != nil {
 			wg.Done()
 			return
 		}
+		ctx := hs.WithHTTPStat(req.Context(), &result)
+		req = req.WithContext(ctx)
+		req.Close = true
 
-		if _, err := io.Copy(ioutil.Discard, res.Body); err != nil {
+		res, err := g_httpClientMap[uri].Do(req)
+		if res != nil {
+			defer res.Body.Close()
+		}
+		if err != nil {
+			result.End(time.Now())
 			wg.Done()
 			return
 		}
-		res.Body.Close()
+		defer res.Body.Close()
+
+		if _, err := ioutil.ReadAll(res.Body); err != nil {
+			result.End(time.Now())
+			wg.Done()
+			return
+		}
 		result.End(time.Now())
 	}
 
@@ -201,11 +205,18 @@ func main() {
 	if dest == nil || len(*dest) == 0 {
 		panic("error dest")
 	}
+	g_httpClientMap = make(map[string]*http.Client)
 	l := strings.Split(*dest, ",")
 	for _, i := range l {
 		_, _, _, ok := isURI(i)
 		if ok {
 			destList = append(destList, i)
+			g_httpClientMap[i] = &http.Client{
+				Transport: &http.Transport{
+					DisableKeepAlives: true,
+				},
+				Timeout: 5 * time.Second,
+			}
 		}
 	}
 
@@ -217,6 +228,7 @@ func main() {
 
 	doing = false
 	g_statMap = make(map[string]hs.Result)
+
 	//doWork()
 	c := cron.New()
 	c.AddFunc("0 */1 * * * ?", doWork)
