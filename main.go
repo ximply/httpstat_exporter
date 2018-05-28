@@ -105,7 +105,7 @@ func worker(uri string, wg *sync.WaitGroup, useCurl bool) {
 
 			time_namelookup := time_namelookup_tl * 1000000000
 			time_connect := time_connect_tl * 1000000000 - time_namelookup
-			time_appconnect := time_appconnect_tl * 1000000000 - time_connect - time_namelookup
+			time_appconnect := time_appconnect_tl * 1000000000 - time_connect_tl * 1000000000
 
 			result.DNSLookup = time.Duration(time_namelookup) / time.Nanosecond
 			result.TCPConnection = time.Duration(time_connect) / time.Nanosecond
